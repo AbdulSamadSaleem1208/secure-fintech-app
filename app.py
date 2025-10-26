@@ -1,10 +1,10 @@
 import streamlit as st
-from pymongo import MongoClient
 import bcrypt
 from cryptography.fernet import Fernet
 import re
 import time
 import os
+from pymongo import MongoClient
 
 # -------------------- INITIAL SETUP --------------------
 KEY_FILE = "secret.key"
@@ -24,13 +24,9 @@ def load_key():
 
 fernet = Fernet(load_key())
 
-# -------------------- MONGODB CONNECTION --------------------
-def get_db():
-    client = MongoClient("mongodb://localhost:27017/")  # local MongoDB
-    db = client["fintech_app"]
-    return db
-
-db = get_db()
+# -------------------- MONGODB SETUP --------------------
+client = MongoClient("mongodb://localhost:27017/")
+db = client["fintech_app"]
 users_col = db["users"]
 audit_col = db["audit_log"]
 
@@ -90,9 +86,10 @@ def register():
         hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
         try:
-            if users_col.find_one({"$or": [{"username": username}, {"email": email}]}):
+            if users_col.find_one({"username": username}) or users_col.find_one({"email": email}):
                 st.error("Username or Email already exists.")
                 return
+
             users_col.insert_one({
                 "username": username,
                 "email": email,
@@ -135,7 +132,11 @@ def login():
 
         try:
             if bcrypt.checkpw(password.encode('utf-8'), hashed_pw):
-                users_col.update_one({"username": username}, {"$set": {"failed_attempts": 0, "lockout_until": 0}})
+                users_col.update_one(
+                    {"username": username},
+                    {"$set": {"failed_attempts": 0, "lockout_until": 0}}
+                )
+
                 st.session_state.logged_in = True
                 st.session_state.username = username
                 st.session_state.last_activity = time.time()
@@ -144,14 +145,14 @@ def login():
                 st.rerun()
             else:
                 fa = failed_attempts + 1
+                update_data = {"failed_attempts": fa}
                 if fa >= LOCKOUT_LIMIT:
-                    lockout_until = now + LOCKOUT_TIME
-                    users_col.update_one({"username": username}, {"$set": {"failed_attempts": fa, "lockout_until": lockout_until}})
-                    log_action(username, "Account Locked After Failed Attempts")
+                    update_data["lockout_until"] = now + LOCKOUT_TIME
                     st.error("🚫 Too many failed attempts. Account temporarily locked.")
+                    log_action(username, "Account Locked After Failed Attempts")
                 else:
-                    users_col.update_one({"username": username}, {"$set": {"failed_attempts": fa}})
                     st.error(f"Invalid password. {LOCKOUT_LIMIT - fa} attempts left.")
+                users_col.update_one({"username": username}, {"$set": update_data})
         except Exception as e:
             st.error("⚠️ Authentication failed. Try again later.")
             log_action("SYSTEM", f"Auth error: {str(e)}")
@@ -239,7 +240,7 @@ def show_logs():
 # -------------------- MAIN --------------------
 def main():
     st.title("💳 Secure FinTech Application")
-    st.markdown("Demonstrating secure authentication, encryption, and MongoDB integration.")
+    st.markdown("Demonstrating secure authentication, encryption, and cybersecurity compliance.")
 
     menu = ["Login", "Register", "About"]
     choice = st.sidebar.selectbox("Menu", menu)
@@ -254,7 +255,7 @@ def main():
             register()
         elif choice == "About":
             st.info("""
-            **Secure FinTech Application (MongoDB Version)**  
+            **Secure FinTech Application (MongoDB version)**  
             - SQL Injection protection ✅  
             - Password & email validation ✅  
             - Session timeout (10 min) ✅  
