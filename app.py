@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3
+from pymongo import MongoClient
 import bcrypt
 from cryptography.fernet import Fernet
 import re
@@ -7,7 +7,6 @@ import time
 import os
 
 # -------------------- INITIAL SETUP --------------------
-DB_FILE = "fintech_secure.db"
 KEY_FILE = "secret.key"
 LOCKOUT_LIMIT = 5
 LOCKOUT_TIME = 300  # 5 minutes
@@ -25,44 +24,24 @@ def load_key():
 
 fernet = Fernet(load_key())
 
-# -------------------- DATABASE SETUP --------------------
-def init_db():
-    """Ensure DB and tables exist before any authentication."""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT UNIQUE,
-                        email TEXT,
-                        password BLOB,
-                        failed_attempts INTEGER DEFAULT 0,
-                        lockout_until REAL DEFAULT 0
-                    )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS audit_log (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT,
-                        action TEXT,
-                        timestamp TEXT
-                    )""")
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        st.error("⚠️ Could not initialize database. Check file permissions or paths.")
-        st.stop()
+# -------------------- MONGODB CONNECTION --------------------
+def get_db():
+    client = MongoClient("mongodb://localhost:27017/")  # local MongoDB
+    db = client["fintech_app"]
+    return db
 
-# Always call DB setup first
-init_db()
+db = get_db()
+users_col = db["users"]
+audit_col = db["audit_log"]
 
 # -------------------- HELPERS --------------------
 def log_action(username, action):
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("INSERT INTO audit_log (username, action, timestamp) VALUES (?, ?, ?)",
-                  (username, action, time.strftime("%Y-%m-%d %H:%M:%S")))
-        conn.commit()
-        conn.close()
+        audit_col.insert_one({
+            "username": username,
+            "action": action,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        })
     except Exception:
         pass
 
@@ -104,7 +83,6 @@ def register():
         if password != confirm:
             st.warning("Passwords do not match.")
             return
-        # ✅ Fixed password regex
         if len(password) < 8 or not re.search(r"(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*\W)", password):
             st.warning("Password must include upper, lower, digit, and special character.")
             return
@@ -112,16 +90,18 @@ def register():
         hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
         try:
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
-                      (username, email, hashed_pw))
-            conn.commit()
-            conn.close()
+            if users_col.find_one({"$or": [{"username": username}, {"email": email}]}):
+                st.error("Username or Email already exists.")
+                return
+            users_col.insert_one({
+                "username": username,
+                "email": email,
+                "password": hashed_pw,
+                "failed_attempts": 0,
+                "lockout_until": 0
+            })
             log_action(username, "User Registered")
             st.success("✅ Registration successful! Please go to Login page.")
-        except sqlite3.IntegrityError:
-            st.error("Username or Email already exists.")
         except Exception as e:
             st.error("⚠️ Registration failed. Try again later.")
             log_action("SYSTEM", f"Registration error: {str(e)}")
@@ -134,11 +114,7 @@ def login():
 
     if st.button("Login"):
         try:
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("SELECT password, failed_attempts, lockout_until FROM users WHERE username = ?", (username,))
-            user = c.fetchone()
-            conn.close()
+            user = users_col.find_one({"username": username})
         except Exception as e:
             st.error("⚠️ Unable to access authentication backend. Try again later.")
             log_action("SYSTEM", f"DB access error: {str(e)}")
@@ -148,7 +124,9 @@ def login():
             st.error("Invalid credentials.")
             return
 
-        hashed_pw, failed_attempts, lockout_until = user
+        hashed_pw = user["password"]
+        failed_attempts = user.get("failed_attempts", 0)
+        lockout_until = user.get("lockout_until", 0)
         now = time.time()
 
         if lockout_until and lockout_until > now:
@@ -157,40 +135,22 @@ def login():
 
         try:
             if bcrypt.checkpw(password.encode('utf-8'), hashed_pw):
-                # reset failed attempts
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                c.execute("UPDATE users SET failed_attempts=0, lockout_until=0 WHERE username=?", (username,))
-                conn.commit()
-                conn.close()
-
+                users_col.update_one({"username": username}, {"$set": {"failed_attempts": 0, "lockout_until": 0}})
                 st.session_state.logged_in = True
                 st.session_state.username = username
                 st.session_state.last_activity = time.time()
                 log_action(username, "User Logged In")
-
                 st.success("✅ Login successful!")
                 st.rerun()
             else:
-                # increment failed attempts
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                c.execute("SELECT failed_attempts FROM users WHERE username=?", (username,))
-                row = c.fetchone()
-                fa = (row[0] if row else 0) + 1
-
+                fa = failed_attempts + 1
                 if fa >= LOCKOUT_LIMIT:
                     lockout_until = now + LOCKOUT_TIME
-                    c.execute("UPDATE users SET failed_attempts=?, lockout_until=? WHERE username=?",
-                              (fa, lockout_until, username))
-                    conn.commit()
-                    conn.close()
+                    users_col.update_one({"username": username}, {"$set": {"failed_attempts": fa, "lockout_until": lockout_until}})
                     log_action(username, "Account Locked After Failed Attempts")
                     st.error("🚫 Too many failed attempts. Account temporarily locked.")
                 else:
-                    c.execute("UPDATE users SET failed_attempts=? WHERE username=?", (fa, username))
-                    conn.commit()
-                    conn.close()
+                    users_col.update_one({"username": username}, {"$set": {"failed_attempts": fa}})
                     st.error(f"Invalid password. {LOCKOUT_LIMIT - fa} attempts left.")
         except Exception as e:
             st.error("⚠️ Authentication failed. Try again later.")
@@ -228,11 +188,7 @@ def update_profile():
             st.warning("Invalid email format.")
         else:
             try:
-                conn = sqlite3.connect(DB_FILE)
-                c = conn.cursor()
-                c.execute("UPDATE users SET email=? WHERE username=?", (new_email, st.session_state.username))
-                conn.commit()
-                conn.close()
+                users_col.update_one({"username": st.session_state.username}, {"$set": {"email": new_email}})
                 log_action(st.session_state.username, "Email Updated")
                 st.success("✅ Email updated successfully!")
             except Exception:
@@ -274,20 +230,16 @@ def upload_file():
 def show_logs():
     st.write("### 📜 User Activity Logs")
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT username, action, timestamp FROM audit_log ORDER BY id DESC")
-        logs = c.fetchall()
-        conn.close()
+        logs = audit_col.find().sort("_id", -1)
         for l in logs:
-            st.text(f"{l[2]} | {l[0]} | {l[1]}")
+            st.text(f"{l['timestamp']} | {l['username']} | {l['action']}")
     except Exception:
         st.error("⚠️ Could not load logs.")
 
 # -------------------- MAIN --------------------
 def main():
     st.title("💳 Secure FinTech Application")
-    st.markdown("Demonstrating secure authentication, encryption, and cybersecurity compliance.")
+    st.markdown("Demonstrating secure authentication, encryption, and MongoDB integration.")
 
     menu = ["Login", "Register", "About"]
     choice = st.sidebar.selectbox("Menu", menu)
@@ -302,7 +254,7 @@ def main():
             register()
         elif choice == "About":
             st.info("""
-            **Secure FinTech Application (Full Test Compliance)**  
+            **Secure FinTech Application (MongoDB Version)**  
             - SQL Injection protection ✅  
             - Password & email validation ✅  
             - Session timeout (10 min) ✅  
