@@ -1,4 +1,5 @@
 streamlit
 pymongo
-bcrypt
 cryptography
+bcrypt
+dnspython
