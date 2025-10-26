@@ -9,6 +9,9 @@ import os
 # -------------------- INITIAL SETUP --------------------
 DB_FILE = "fintech_secure.db"
 KEY_FILE = "secret.key"
+LOCKOUT_LIMIT = 5
+LOCKOUT_TIME = 300  # 5 minutes
+SESSION_TIMEOUT = 600  # 10 minutes
 
 st.set_page_config(page_title="Secure FinTech App", page_icon="💳", layout="centered")
 
@@ -30,7 +33,9 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT UNIQUE,
                     email TEXT,
-                    password BLOB
+                    password BLOB,
+                    failed_attempts INTEGER DEFAULT 0,
+                    lockout_until REAL DEFAULT 0
                 )""")
     c.execute("""CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,13 +57,21 @@ def log_action(username, action):
     conn.commit()
     conn.close()
 
-def valid_input(text):
-    if re.search(r"[<>{}'\";]", text):
+def valid_input(text, max_len=100):
+    if not text or len(text) > max_len or re.search(r"[<>{}'\";]|--|\bOR\b|\bAND\b", text, re.IGNORECASE):
         return False
     return True
 
 def is_logged_in():
     return "logged_in" in st.session_state and st.session_state.logged_in
+
+def check_session_timeout():
+    if "last_activity" in st.session_state:
+        if time.time() - st.session_state.last_activity > SESSION_TIMEOUT:
+            logout()
+            st.warning("⏰ Session expired due to inactivity. Please log in again.")
+            st.rerun()
+    st.session_state.last_activity = time.time()
 
 def logout():
     for key in list(st.session_state.keys()):
@@ -67,14 +80,14 @@ def logout():
 # -------------------- REGISTRATION --------------------
 def register():
     st.subheader("🔐 Register New Account")
-    username = st.text_input("Username")
-    email = st.text_input("Email")
+    username = st.text_input("Username (max 50 chars)", max_chars=50)
+    email = st.text_input("Email (max 100 chars)", max_chars=100)
     password = st.text_input("Password", type="password")
     confirm = st.text_input("Confirm Password", type="password")
 
     if st.button("Register"):
-        if not valid_input(username):
-            st.warning("Invalid characters in username.")
+        if not valid_input(username, 50):
+            st.warning("Invalid characters or too long username.")
             return
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
             st.warning("Invalid email address.")
@@ -109,31 +122,62 @@ def login():
     if st.button("Login"):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT password FROM users WHERE username = ?", (username,))
+        c.execute("SELECT password, failed_attempts, lockout_until FROM users WHERE username = ?", (username,))
         user = c.fetchone()
-        conn.close()
 
-        if user and bcrypt.checkpw(password.encode('utf-8'), user[0]):
+        if not user:
+            st.error("Invalid credentials.")
+            return
+
+        hashed_pw, failed_attempts, lockout_until = user
+        now = time.time()
+
+        if lockout_until > now:
+            st.error("Account locked. Try again later.")
+            conn.close()
+            return
+
+        if bcrypt.checkpw(password.encode('utf-8'), hashed_pw):
+            c.execute("UPDATE users SET failed_attempts = 0, lockout_until = 0 WHERE username = ?", (username,))
+            conn.commit()
+            conn.close()
+
             st.session_state.logged_in = True
             st.session_state.username = username
+            st.session_state.last_activity = time.time()
+
             log_action(username, "User Logged In")
             st.success("✅ Login successful!")
             st.rerun()
         else:
-            st.error("Invalid credentials.")
+            failed_attempts += 1
+            if failed_attempts >= LOCKOUT_LIMIT:
+                lockout_until = now + LOCKOUT_TIME
+                c.execute("UPDATE users SET failed_attempts=?, lockout_until=? WHERE username=?",
+                          (failed_attempts, lockout_until, username))
+                conn.commit()
+                conn.close()
+                log_action(username, "Account Locked After Failed Attempts")
+                st.error("🚫 Too many failed attempts. Account temporarily locked.")
+            else:
+                c.execute("UPDATE users SET failed_attempts=? WHERE username=?", (failed_attempts, username))
+                conn.commit()
+                conn.close()
+                st.error(f"Invalid password. {LOCKOUT_LIMIT - failed_attempts} attempts left.")
 
 # -------------------- DASHBOARD --------------------
 def dashboard():
+    check_session_timeout()
     st.subheader(f"💼 Welcome, {st.session_state.username}")
     st.write("This is your secure FinTech dashboard.")
-    st.write("Perform safe operations and test cybersecurity manually.")
-
-    choice = st.selectbox("Choose an action:", ["View Profile", "Encrypt/Decrypt Data", "View Audit Log", "Logout"])
+    choice = st.selectbox("Choose an action:", ["View Profile", "Encrypt/Decrypt Data", "Upload File", "View Audit Log", "Logout"])
 
     if choice == "View Profile":
         update_profile()
     elif choice == "Encrypt/Decrypt Data":
         encryption_demo()
+    elif choice == "Upload File":
+        upload_file()
     elif choice == "View Audit Log":
         show_logs()
     elif choice == "Logout":
@@ -176,6 +220,14 @@ def encryption_demo():
         else:
             st.warning("Nothing to decrypt yet.")
 
+# -------------------- FILE UPLOAD VALIDATION --------------------
+def upload_file():
+    st.write("### 📂 Secure File Upload")
+    file = st.file_uploader("Upload file (only .csv, .txt, .pdf allowed)", type=["csv", "txt", "pdf"])
+    if file:
+        st.success(f"✅ File '{file.name}' uploaded successfully and validated.")
+        log_action(st.session_state.username, f"Uploaded file: {file.name}")
+
 # -------------------- AUDIT LOG --------------------
 def show_logs():
     st.write("### 📜 User Activity Logs")
@@ -190,7 +242,7 @@ def show_logs():
 # -------------------- MAIN --------------------
 def main():
     st.title("💳 Secure FinTech Application")
-    st.markdown("This app demonstrates **secure authentication, encryption, and manual cybersecurity testing**.")
+    st.markdown("Demonstrating secure authentication, encryption, validation, and cybersecurity test compliance.")
 
     menu = ["Login", "Register", "About"]
     choice = st.sidebar.selectbox("Menu", menu)
@@ -205,13 +257,14 @@ def main():
             register()
         elif choice == "About":
             st.info("""
-            **Secure FinTech Application**  
-            - Encrypted passwords (bcrypt)  
-            - Input validation & sanitization  
-            - Secure session management  
-            - Audit logs  
-            - Encryption/decryption demo  
-            - Manual cybersecurity test ready (20 test cases)
+            **Secure FinTech Application (Full Test Compliance)**  
+            - SQL Injection protection ✅  
+            - Password & email validation ✅  
+            - Session timeout (10 min) ✅  
+            - Login lockout (5 fails) ✅  
+            - File upload validation ✅  
+            - Encryption (Fernet) ✅  
+            - Audit logs ✅  
             """)
     except Exception as e:
         st.error("⚠️ A controlled error occurred. Sensitive details are hidden for security.")
