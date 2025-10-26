@@ -9,7 +9,8 @@ import re
 from datetime import datetime, timedelta
 import pandas as pd
 import io
-import magic  # optional, file type detection
+import filetype
+
 
 # ---------------------------
 # Configuration / Constants
@@ -503,3 +504,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
