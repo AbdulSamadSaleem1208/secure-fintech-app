@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+openpyxl
+plotly
+matplotlib
+altair
+seaborn
+requests
+Pillow
+streamlit-option-menu
+streamlit-extras
