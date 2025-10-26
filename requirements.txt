@@ -2,3 +2,4 @@ streamlit==1.39.0
 bcrypt==4.2.0
 cryptography==43.0.1
 sqlite3-binary
+rich<14
