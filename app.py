@@ -95,7 +95,8 @@ def register():
         if password != confirm:
             st.warning("Passwords do not match.")
             return
-        if len(password) < 8 or not re.search(r"(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*\\W)", password):
+        # ✅ FIXED regex for strong password check
+        if len(password) < 8 or not re.search(r"(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*\W)", password):
             st.warning("Password must include upper, lower, digit, and special character.")
             return
 
@@ -170,7 +171,10 @@ def dashboard():
     check_session_timeout()
     st.subheader(f"💼 Welcome, {st.session_state.username}")
     st.write("This is your secure FinTech dashboard.")
-    choice = st.selectbox("Choose an action:", ["View Profile", "Encrypt/Decrypt Data", "Upload File", "View Audit Log", "Logout"])
+    choice = st.selectbox(
+        "Choose an action:",
+        ["View Profile", "Encrypt/Decrypt Data", "Upload File", "View Audit Log", "Logout"]
+    )
 
     if choice == "View Profile":
         update_profile()
