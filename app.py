@@ -1,17 +1,18 @@
+# app.py
+import os
+import time
+import re
 import streamlit as st
 import bcrypt
 from cryptography.fernet import Fernet
-import re
-import time
-import os
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 
-# -------------------- INITIAL SETUP --------------------
+# -------------------- CONFIG --------------------
 KEY_FILE = "secret.key"
 LOCKOUT_LIMIT = 5
-LOCKOUT_TIME = 300  # 5 minutes
-SESSION_TIMEOUT = 600  # 10 minutes
+LOCKOUT_TIME = 300   # seconds (5 minutes)
+SESSION_TIMEOUT = 600  # seconds (10 minutes)
 
 st.set_page_config(page_title="Secure FinTech App", page_icon="💳", layout="centered")
 
@@ -25,22 +26,45 @@ def load_key():
 
 fernet = Fernet(load_key())
 
-# -------------------- MONGODB ATLAS CONNECTION --------------------
-# ✅ Use your MongoDB Atlas connection string here
-MONGO_URI = "mongodb+srv://abdulsamadsaleem1208_db_user:gJrAH4XNTJ4IA1EJ@cluster0.qkvquvb.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+# -------------------- MONGO / SECRETS --------------------
+# Replace USER and CLUSTER with your values (these are non-secret)
+MONGO_USER = "abdulsamadsaleem1208_db_user"
+MONGO_CLUSTER = "cluster0.qkvquvb.mongodb.net"
+MONGO_DBNAME = "fintech_db"   # as you confirmed
 
-try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    client.admin.command('ping')  # test connection
-    st.sidebar.success("✅ Connected to MongoDB Atlas")
-except ConnectionFailure:
-    st.sidebar.error("⚠️ Cannot connect to MongoDB Atlas. Check your network or URI.")
+def get_mongo_password():
+    # Prefer Streamlit secrets
+    try:
+        if "MONGODB_PASSWORD" in st.secrets:
+            return st.secrets["MONGODB_PASSWORD"]
+    except Exception:
+        pass
+    # Fallback to environment variable for local dev
+    return os.getenv("MONGODB_PASSWORD")
+
+MONGO_PWD = get_mongo_password()
+if not MONGO_PWD:
+    st.error("🔒 MongoDB password not found. Set MONGODB_PASSWORD in Streamlit secrets (recommended) or as an environment variable for local testing.")
     st.stop()
 
-# Use your actual database name and collection names
-db = client["fintech"]
+# Build connection string including DB name
+MONGO_URI = f"mongodb+srv://{MONGO_USER}:{MONGO_PWD}@{MONGO_CLUSTER}/{MONGO_DBNAME}?retryWrites=true&w=majority"
+
+# Attempt connection
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+    client.admin.command("ping")
+    st.sidebar.success("✅ Connected to MongoDB Atlas")
+except ConnectionFailure as e:
+    st.sidebar.error("⚠️ Cannot connect to MongoDB Atlas. Check your secrets and IP Access List.")
+    st.write("Connection error:", str(e))
+    st.stop()
+
+# Collections
+db = client[MONGO_DBNAME]
 users_col = db["users"]
 audit_col = db["audit_log"]
+pred_col = db["predictions"]  # optional predictions collection
 
 # -------------------- HELPERS --------------------
 def log_action(username, action):
@@ -59,27 +83,27 @@ def valid_input(text, max_len=100):
     return True
 
 def is_logged_in():
-    return "logged_in" in st.session_state and st.session_state.logged_in
+    return st.session_state.get("logged_in", False)
 
 def check_session_timeout():
     if "last_activity" in st.session_state:
-        if time.time() - st.session_state.last_activity > SESSION_TIMEOUT:
+        if time.time() - st.session_state["last_activity"] > SESSION_TIMEOUT:
             logout()
             st.warning("⏰ Session expired. Please log in again.")
             st.rerun()
-    st.session_state.last_activity = time.time()
+    st.session_state["last_activity"] = time.time()
 
 def logout():
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
 
 # -------------------- REGISTRATION --------------------
 def register():
     st.subheader("🔐 Register New Account")
-    username = st.text_input("Username (max 50 chars)", max_chars=50)
-    email = st.text_input("Email (max 100 chars)", max_chars=100)
-    password = st.text_input("Password", type="password")
-    confirm = st.text_input("Confirm Password", type="password")
+    username = st.text_input("Username (max 50 chars)", max_chars=50, key="reg_username")
+    email = st.text_input("Email (max 100 chars)", max_chars=100, key="reg_email")
+    password = st.text_input("Password", type="password", key="reg_password")
+    confirm = st.text_input("Confirm Password", type="password", key="reg_confirm")
 
     if st.button("Register"):
         if not valid_input(username, 50):
@@ -95,7 +119,7 @@ def register():
             st.warning("Password must include upper, lower, digit, and special character.")
             return
 
-        hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+        hashed_pw = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
 
         try:
             if users_col.find_one({"username": username}) or users_col.find_one({"email": email}):
@@ -107,7 +131,8 @@ def register():
                 "email": email,
                 "password": hashed_pw,
                 "failed_attempts": 0,
-                "lockout_until": 0
+                "lockout_until": 0,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
             })
             log_action(username, "User Registered")
             st.success("✅ Registration successful! Please go to Login page.")
@@ -118,8 +143,8 @@ def register():
 # -------------------- LOGIN --------------------
 def login():
     st.subheader("🔑 Login to Your Account")
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
+    username = st.text_input("Username", key="login_username")
+    password = st.text_input("Password", type="password", key="login_password")
 
     if st.button("Login"):
         try:
@@ -133,7 +158,7 @@ def login():
             st.error("Invalid credentials.")
             return
 
-        hashed_pw = user["password"]
+        hashed_pw = user.get("password")
         failed_attempts = user.get("failed_attempts", 0)
         lockout_until = user.get("lockout_until", 0)
         now = time.time()
@@ -143,15 +168,14 @@ def login():
             return
 
         try:
-            if bcrypt.checkpw(password.encode('utf-8'), hashed_pw):
-                users_col.update_one(
-                    {"username": username},
-                    {"$set": {"failed_attempts": 0, "lockout_until": 0}}
-                )
+            if isinstance(hashed_pw, str):
+                hashed_pw = hashed_pw.encode("utf-8")
 
-                st.session_state.logged_in = True
-                st.session_state.username = username
-                st.session_state.last_activity = time.time()
+            if bcrypt.checkpw(password.encode("utf-8"), hashed_pw):
+                users_col.update_one({"username": username}, {"$set": {"failed_attempts": 0, "lockout_until": 0}})
+                st.session_state["logged_in"] = True
+                st.session_state["username"] = username
+                st.session_state["last_activity"] = time.time()
                 log_action(username, "User Logged In")
                 st.success("✅ Login successful!")
                 st.rerun()
@@ -172,14 +196,15 @@ def login():
 # -------------------- DASHBOARD --------------------
 def dashboard():
     check_session_timeout()
-    st.subheader(f"💼 Welcome, {st.session_state.username}")
+    st.subheader(f"💼 Welcome, {st.session_state.get('username')}")
     st.write("This is your secure FinTech dashboard.")
 
-    choice = st.selectbox("Choose an action:",
-                          ["View Profile", "Encrypt/Decrypt Data", "Upload File", "View Audit Log", "Logout"])
+    choice = st.selectbox("Choose an action:", ["View Profile", "Add Prediction", "Encrypt/Decrypt Data", "Upload File", "View Audit Log", "Logout"], key="dashboard_choice")
 
     if choice == "View Profile":
         update_profile()
+    elif choice == "Add Prediction":
+        add_prediction()
     elif choice == "Encrypt/Decrypt Data":
         encryption_demo()
     elif choice == "Upload File":
@@ -187,7 +212,7 @@ def dashboard():
     elif choice == "View Audit Log":
         show_logs()
     elif choice == "Logout":
-        log_action(st.session_state.username, "User Logged Out")
+        log_action(st.session_state.get("username"), "User Logged Out")
         logout()
         st.info("You have been logged out.")
         st.rerun()
@@ -195,22 +220,45 @@ def dashboard():
 # -------------------- PROFILE --------------------
 def update_profile():
     st.write("### 🧾 Update Profile Info")
-    new_email = st.text_input("New Email")
+    new_email = st.text_input("New Email", key="new_email")
     if st.button("Update Email"):
         if not re.match(r"[^@]+@[^@]+\.[^@]+", new_email):
             st.warning("Invalid email format.")
         else:
             try:
-                users_col.update_one({"username": st.session_state.username}, {"$set": {"email": new_email}})
-                log_action(st.session_state.username, "Email Updated")
+                users_col.update_one({"username": st.session_state.get("username")}, {"$set": {"email": new_email}})
+                log_action(st.session_state.get("username"), "Email Updated")
                 st.success("✅ Email updated successfully!")
             except Exception:
                 st.error("⚠️ Could not update email. Try again later.")
 
+# -------------------- PREDICTIONS --------------------
+def add_prediction():
+    st.write("### 🧠 Save a Prediction (example)")
+    pred_text = st.text_input("Prediction/result", key="pred_text")
+    pred_value = st.number_input("Score", value=0.0, step=0.1, key="pred_score")
+    if st.button("Save Prediction"):
+        if not is_logged_in():
+            st.warning("Please login first.")
+            return
+        try:
+            pred_doc = {
+                "username": st.session_state.get("username"),
+                "text": pred_text,
+                "score": float(pred_value),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            pred_col.insert_one(pred_doc)
+            log_action(st.session_state.get("username"), "Saved Prediction")
+            st.success("✅ Prediction saved.")
+        except Exception as e:
+            st.error("⚠️ Could not save prediction.")
+            log_action("SYSTEM", f"Prediction save error: {str(e)}")
+
 # -------------------- ENCRYPTION DEMO --------------------
 def encryption_demo():
     st.write("### 🔐 Data Encryption / Decryption")
-    data = st.text_input("Enter data to encrypt:")
+    data = st.text_input("Enter data to encrypt:", key="enc_input")
     if st.button("Encrypt"):
         if data:
             try:
@@ -234,28 +282,28 @@ def encryption_demo():
 # -------------------- FILE UPLOAD --------------------
 def upload_file():
     st.write("### 📂 Secure File Upload")
-    file = st.file_uploader("Upload file (.csv, .txt, .pdf only)", type=["csv", "txt", "pdf"])
-    if file:
-        st.success(f"✅ File '{file.name}' uploaded successfully.")
-        log_action(st.session_state.username, f"Uploaded file: {file.name}")
+    uploaded_file = st.file_uploader("Upload file (.csv, .txt, .pdf only)", type=["csv", "txt", "pdf"], key="upload")
+    if uploaded_file:
+        st.success(f"✅ File '{uploaded_file.name}' uploaded successfully.")
+        log_action(st.session_state.get("username"), f"Uploaded file: {uploaded_file.name}")
 
 # -------------------- AUDIT LOG --------------------
 def show_logs():
     st.write("### 📜 User Activity Logs")
     try:
-        logs = audit_col.find().sort("_id", -1)
+        logs = audit_col.find().sort("_id", -1).limit(200)
         for l in logs:
-            st.text(f"{l['timestamp']} | {l['username']} | {l['action']}")
+            st.text(f"{l.get('timestamp')} | {l.get('username')} | {l.get('action')}")
     except Exception:
         st.error("⚠️ Could not load logs.")
 
 # -------------------- MAIN --------------------
 def main():
     st.title("💳 Secure FinTech Application")
-    st.markdown("Demonstrating secure authentication, encryption, and cybersecurity compliance.")
+    st.markdown("Demonstrating secure authentication, encryption, and example predictions storage.")
 
     menu = ["Login", "Register", "About"]
-    choice = st.sidebar.selectbox("Menu", menu)
+    choice = st.sidebar.selectbox("Menu", menu, key="main_menu")
 
     try:
         if choice == "Login":
@@ -275,7 +323,7 @@ def main():
             - Login lockout (5 fails) ✅  
             - File upload validation ✅  
             - Encryption (Fernet) ✅  
-            - Audit logs ✅  
+            - Audit logs & predictions ✅  
             """)
     except Exception as e:
         st.error("⚠️ A controlled error occurred. Sensitive details are hidden for security.")
@@ -283,4 +331,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
