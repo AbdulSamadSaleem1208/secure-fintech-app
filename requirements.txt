@@ -1,5 +1,7 @@
 streamlit==1.39.0
 bcrypt==4.2.0
 cryptography==43.0.1
-sqlite3-binary
-rich<14
+pandas==2.2.3
+yfinance==0.2.43
+requests==2.32.3
+rich==13.7.1
