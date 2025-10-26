@@ -1,507 +1,222 @@
-# app.py
 import streamlit as st
 import sqlite3
-from passlib.hash import bcrypt
+from flask_bcrypt import Bcrypt
 from cryptography.fernet import Fernet
-import base64
-import os
 import re
-from datetime import datetime, timedelta
-import pandas as pd
-import io
-import filetype
+import time
+import os
 
+# -------------------- INITIAL SETUP --------------------
+bcrypt = Bcrypt()
+DB_FILE = "fintech_secure.db"
+KEY_FILE = "secret.key"
 
-# ---------------------------
-# Configuration / Constants
-# ---------------------------
-DB_PATH = "hbl_fintech.db"
-KEY_PATH = "fernet.key"
-SESSION_TIMEOUT_MINUTES = 10  # idle timeout for demo (adjustable)
-MAX_UPLOAD_SIZE_MB = 2
-ALLOWED_FILE_EXTS = [".png", ".jpg", ".jpeg", ".pdf", ".txt", ".csv"]
+st.set_page_config(page_title="Secure FinTech App", page_icon="💳", layout="centered")
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def get_key():
-    """Load or generate a fernet key"""
-    if os.path.exists(KEY_PATH):
-        with open(KEY_PATH, "rb") as f:
-            return f.read()
-    else:
+# -------------------- ENCRYPTION KEY --------------------
+def load_key():
+    if not os.path.exists(KEY_FILE):
         key = Fernet.generate_key()
-        with open(KEY_PATH, "wb") as f:
+        with open(KEY_FILE, "wb") as f:
             f.write(key)
-        return key
+    return open(KEY_FILE, "rb").read()
 
-FERNET = Fernet(get_key())
+fernet = Fernet(load_key())
 
-def encrypt_text(plaintext: str) -> bytes:
-    if plaintext is None:
-        return None
-    return FERNET.encrypt(plaintext.encode())
-
-def decrypt_text(token: bytes) -> str:
-    if token is None:
-        return None
-    return FERNET.decrypt(token).decode()
-
+# -------------------- DATABASE SETUP --------------------
 def init_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cur = conn.cursor()
-    
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        password_hash TEXT,
-        email BLOB,
-        created_at TEXT
-    )
-    """)
-  
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS profiles (
-        user_id INTEGER PRIMARY KEY,
-        full_name BLOB,
-        phone BLOB,
-        balance_encrypted BLOB,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )
-    """)
-    # Audit logs
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS audit_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        action TEXT,
-        details TEXT,
-        timestamp TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )
-    """)
-    # Optional files table
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS uploads (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        filename TEXT,
-        content BLOB,
-        content_type TEXT,
-        uploaded_at TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )
-    """)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE,
+                    email TEXT,
+                    password TEXT
+                )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT,
+                    action TEXT,
+                    timestamp TEXT
+                )""")
     conn.commit()
-    return conn
+    conn.close()
 
-conn = init_db()
+init_db()
 
-def log_action(user_id, action, details=""):
-    cur = conn.cursor()
-    cur.execute("INSERT INTO audit_logs (user_id, action, details, timestamp) VALUES (?, ?, ?, ?)",
-                (user_id, action, details, datetime.utcnow().isoformat()))
+# -------------------- HELPERS --------------------
+def log_action(username, action):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO audit_log (username, action, timestamp) VALUES (?, ?, ?)",
+              (username, action, time.strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
+    conn.close()
 
-def get_user_by_username(username):
-    cur = conn.cursor()
-    cur.execute("SELECT id, username, password_hash, email, created_at FROM users WHERE username = ?", (username,))
-    row = cur.fetchone()
-    return row
-
-def create_user(username, password_plain, email_plain):
-    pw_hash = bcrypt.hash(password_plain)
-    email_enc = encrypt_text(email_plain)
-    cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO users (username, password_hash, email, created_at) VALUES (?, ?, ?, ?)",
-                    (username, pw_hash, email_enc, datetime.utcnow().isoformat()))
-        conn.commit()
-        user_id = cur.lastrowid
-        # create empty profile
-        cur.execute("INSERT OR REPLACE INTO profiles (user_id, full_name, phone, balance_encrypted) VALUES (?, ?, ?, ?)",
-                    (user_id, None, None, encrypt_text("0.00")))
-        conn.commit()
-        log_action(user_id, "register", "User registered")
-        return user_id
-    except sqlite3.IntegrityError:
-        return None
-
-# ---------------------------
-# Password policy
-# ---------------------------
-def validate_password_policy(pw: str) -> (bool, str):
-    if len(pw) < 8:
-        return False, "Password must be at least 8 characters."
-    if not re.search(r"[A-Z]", pw):
-        return False, "Include at least one uppercase letter."
-    if not re.search(r"[a-z]", pw):
-        return False, "Include at least one lowercase letter."
-    if not re.search(r"[0-9]", pw):
-        return False, "Include at least one digit."
-    if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", pw):
-        return False, "Include at least one special character (!@#$...)."
-    return True, "OK"
-
-# ---------------------------
-# Session helpers
-# ---------------------------
-def initialize_session_state():
-    if 'logged_in' not in st.session_state:
-        st.session_state.logged_in = False
-        st.session_state.user_id = None
-        st.session_state.username = None
-        st.session_state.last_active = datetime.utcnow()
-
-def touch_session():
-    st.session_state.last_active = datetime.utcnow()
-
-def is_session_expired():
-    if not st.session_state.logged_in:
+def valid_input(text):
+    if re.search(r"[<>{}'\";]", text):
         return False
-    idle = datetime.utcnow() - st.session_state.last_active
-    return idle > timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+    return True
+
+def is_logged_in():
+    return "logged_in" in st.session_state and st.session_state.logged_in
 
 def logout():
-    if st.session_state.logged_in:
-        log_action(st.session_state.user_id, "logout", "User logged out")
-    st.session_state.logged_in = False
-    st.session_state.user_id = None
-    st.session_state.username = None
-    st.session_state.last_active = datetime.utcnow()
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
 
-# ---------------------------
-# Inputs validation helpers
-# ---------------------------
-def safe_numeric_input(value, min_val=None, max_val=None):
-    try:
-        f = float(value)
-    except Exception:
-        return None, "Not a valid number"
-    if (min_val is not None and f < min_val) or (max_val is not None and f > max_val):
-        return None, f"Value must be between {min_val} and {max_val}"
-    return f, None
+# -------------------- REGISTRATION --------------------
+def register():
+    st.subheader("🔐 Register New Account")
+    username = st.text_input("Username")
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
+    confirm = st.text_input("Confirm Password", type="password")
 
-def validate_filename(filename):
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in ALLOWED_FILE_EXTS:
-        return False, f"Extension {ext} not allowed"
-    return True, None
+    if st.button("Register"):
+        if not valid_input(username):
+            st.warning("Invalid characters in username.")
+            return
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            st.warning("Invalid email address.")
+            return
+        if password != confirm:
+            st.warning("Passwords do not match.")
+            return
+        if len(password) < 8 or not re.search(r"(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*\\W)", password):
+            st.warning("Password must include upper, lower, digit, and special character.")
+            return
 
-def detect_mime(file_bytes):
-    try:
-        m = magic.from_buffer(file_bytes, mime=True)
-        return m
-    except Exception:
-        return None
+        hashed_pw = bcrypt.generate_password_hash(password).decode("utf-8")
 
-# ---------------------------
-# App UI Pages
-# ---------------------------
-def registration_page():
-    st.header("Register")
-    try:
-        with st.form("register_form"):
-            username = st.text_input("Username").strip()
-            email = st.text_input("Email")
-            pw = st.text_input("Password", type="password")
-            pw2 = st.text_input("Confirm Password", type="password")
-            submitted = st.form_submit_button("Register")
-            if submitted:
-                if not username or not email or not pw or not pw2:
-                    st.warning("All fields are required.")
-                elif pw != pw2:
-                    st.error("Passwords do not match.")
-                else:
-                    ok, msg = validate_password_policy(pw)
-                    if not ok:
-                        st.error(f"Password policy error: {msg}")
-                    else:
-                        user_id = create_user(username, pw, email)
-                        if user_id is None:
-                            st.error("Username already exists. Choose another.")
-                        else:
-                            st.success("Registration successful. Please log in.")
-    except Exception as e:
-        st.error("An error occurred while registering. Please try again.")
-        # Do not reveal exception details to the user
-
-def login_page():
-    st.header("Login")
-    try:
-        with st.form("login_form"):
-            username = st.text_input("Username").strip()
-            pw = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Login")
-            if submitted:
-                if not username or not pw:
-                    st.warning("Enter username and password.")
-                else:
-                    row = get_user_by_username(username)
-                    if row is None:
-                        st.error("Invalid username or password.")
-                    else:
-                        user_id, uname, pw_hash, email_enc, created_at = row
-                        if bcrypt.verify(pw, pw_hash):
-                            st.session_state.logged_in = True
-                            st.session_state.user_id = user_id
-                            st.session_state.username = uname
-                            touch_session()
-                            log_action(user_id, "login", "User logged in")
-                            st.experimental_rerun()
-                        else:
-                            # log failed attempt
-                            log_action(None, "failed_login", f"username={username}")
-                            st.error("Invalid username or password.")
-    except Exception:
-        st.error("Login service currently unavailable.")
-
-def dashboard_page():
-    touch_session()
-    st.header("Dashboard")
-    st.write(f"Welcome, **{st.session_state.username}**")
-    # Show profile summary
-    cur = conn.cursor()
-    cur.execute("SELECT u.id, u.username, u.email, p.full_name, p.phone, p.balance_encrypted FROM users u LEFT JOIN profiles p ON u.id = p.user_id WHERE u.id = ?", (st.session_state.user_id,))
-    row = cur.fetchone()
-    if row:
-        uid, uname, email_enc, name_enc, phone_enc, balance_enc = row
-        email = decrypt_text(email_enc) if email_enc else ""
-        full_name = decrypt_text(name_enc) if name_enc else ""
-        phone = decrypt_text(phone_enc) if phone_enc else ""
-        balance = decrypt_text(balance_enc) if balance_enc else "0.00"
-        st.subheader("Profile Summary")
-        st.write(f"**Full name:** {full_name or 'Not set'}")
-        st.write(f"**Email:** {email or 'Not set'}")
-        st.write(f"**Phone:** {phone or 'Not set'}")
-        st.write(f"**Account Balance (encrypted):** {balance}")
-    else:
-        st.info("Profile not found.")
-
-    # Quick actions
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if st.button("New Transaction"):
-            st.session_state.page = "transaction"
-            st.experimental_rerun()
-    with col2:
-        if st.button("Upload File"):
-            st.session_state.page = "upload"
-            st.experimental_rerun()
-    with col3:
-        if st.button("View Logs"):
-            st.session_state.page = "logs"
-            st.experimental_rerun()
-
-def transaction_page():
-    touch_session()
-    st.header("Create Transaction (Demo)")
-    st.write("Input a numeric amount and description. This demonstrates input validation and audit logging.")
-    try:
-        with st.form("txn"):
-            amount_raw = st.text_input("Amount (PKR)")
-            description = st.text_area("Description", max_chars=300)
-            submit = st.form_submit_button("Submit Transaction")
-            if submit:
-                amount, err = safe_numeric_input(amount_raw, min_val=0.01)
-                if err:
-                    st.error(f"Amount error: {err}")
-                elif not description.strip():
-                    st.error("Description required.")
-                else:
-                    # For demo, we will store a "transaction" in audit logs
-                    details = f"Txn amount={amount:.2f}; desc={description[:100]}"
-                    log_action(st.session_state.user_id, "transaction", details)
-                    st.success("Transaction recorded (audit logged).")
-    except Exception:
-        st.error("Could not process transaction. Please try again.")
-
-def profile_page():
-    touch_session()
-    st.header("Update Profile")
-    cur = conn.cursor()
-    cur.execute("SELECT full_name, phone, balance_encrypted FROM profiles WHERE user_id = ?", (st.session_state.user_id,))
-    row = cur.fetchone()
-    name = ""
-    phone = ""
-    balance = "0.00"
-    if row:
-        name_enc, phone_enc, bal_enc = row
-        name = decrypt_text(name_enc) if name_enc else ""
-        phone = decrypt_text(phone_enc) if phone_enc else ""
-        balance = decrypt_text(bal_enc) if bal_enc else "0.00"
-    try:
-        with st.form("profile_form"):
-            full_name = st.text_input("Full Name", value=name)
-            phone_in = st.text_input("Phone", value=phone)
-            balance_in = st.text_input("Balance (for demo only)", value=balance)
-            submitted = st.form_submit_button("Save Profile")
-            if submitted:
-                # Basic validation
-                if len(full_name) > 100:
-                    st.error("Full name too long.")
-                else:
-                    # Validate numeric balance
-                    bal_float, err = safe_numeric_input(balance_in, min_val=0)
-                    if err:
-                        st.error("Balance must be numeric and non-negative.")
-                    else:
-                        cur.execute("UPDATE profiles SET full_name = ?, phone = ?, balance_encrypted = ? WHERE user_id = ?",
-                                    (encrypt_text(full_name), encrypt_text(phone_in), encrypt_text(f"{bal_float:.2f}"), st.session_state.user_id))
-                        conn.commit()
-                        log_action(st.session_state.user_id, "profile_update", "Updated profile fields")
-                        st.success("Profile updated securely.")
-    except Exception:
-        st.error("Failed to update profile. Try again.")
-
-def upload_page():
-    touch_session()
-    st.header("Upload File (validation demo)")
-    try:
-        uploaded = st.file_uploader("Choose a file", type=[ext.strip(".") for ext in ALLOWED_FILE_EXTS])
-        if uploaded is not None:
-            filename = uploaded.name
-            contents = uploaded.read()
-            # size check
-            if len(contents) > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
-                st.error(f"File too large. Max {MAX_UPLOAD_SIZE_MB} MB.")
-                return
-            ok, msg = validate_filename(filename)
-            if not ok:
-                st.error(msg)
-                return
-            mime = detect_mime(contents)
-            # Basic sanity: if magic is available, ensure mime roughly matches ext
-            if mime:
-                st.write(f"Detected MIME: {mime}")
-            # store in DB
-            cur = conn.cursor()
-            cur.execute("INSERT INTO uploads (user_id, filename, content, content_type, uploaded_at) VALUES (?, ?, ?, ?, ?)",
-                        (st.session_state.user_id, filename, contents, mime or "unknown", datetime.utcnow().isoformat()))
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
+                      (username, email, hashed_pw))
             conn.commit()
-            log_action(st.session_state.user_id, "file_upload", f"uploaded {filename}")
-            st.success("File uploaded and logged.")
-    except Exception:
-        st.error("Failed to upload file. Please try a different file.")
+            conn.close()
+            log_action(username, "User Registered")
+            st.success("✅ Registration successful! Please go to Login page.")
+        except sqlite3.IntegrityError:
+            st.error("Username or Email already exists.")
 
-def logs_page():
-    touch_session()
-    st.header("Audit / Activity Logs")
-    cur = conn.cursor()
-    cur.execute("SELECT id, action, details, timestamp FROM audit_logs WHERE user_id = ? ORDER BY timestamp DESC LIMIT 200", (st.session_state.user_id,))
-    rows = cur.fetchall()
-    if not rows:
-        st.info("No logs yet.")
-    else:
-        df = pd.DataFrame(rows, columns=["ID", "Action", "Details", "Timestamp"])
-        st.dataframe(df)
+# -------------------- LOGIN --------------------
+def login():
+    st.subheader("🔑 Login to Your Account")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
 
-def logout_button():
-    if st.button("Logout"):
+    if st.button("Login"):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT password FROM users WHERE username = ?", (username,))
+        user = c.fetchone()
+        conn.close()
+
+        if user and bcrypt.check_password_hash(user[0], password):
+            st.session_state.logged_in = True
+            st.session_state.username = username
+            log_action(username, "User Logged In")
+            st.success("✅ Login successful!")
+            st.rerun()
+        else:
+            st.error("Invalid credentials.")
+
+# -------------------- DASHBOARD --------------------
+def dashboard():
+    st.subheader(f"💼 Welcome, {st.session_state.username}")
+    st.write("This is your secure FinTech dashboard.")
+    st.write("Perform safe operations and test cybersecurity manually.")
+
+    choice = st.selectbox("Choose an action:", ["View Profile", "Encrypt/Decrypt Data", "View Audit Log", "Logout"])
+
+    if choice == "View Profile":
+        update_profile()
+    elif choice == "Encrypt/Decrypt Data":
+        encryption_demo()
+    elif choice == "View Audit Log":
+        show_logs()
+    elif choice == "Logout":
+        log_action(st.session_state.username, "User Logged Out")
         logout()
-        st.experimental_rerun()
+        st.info("You have been logged out.")
+        st.rerun()
 
-# ---------------------------
-# Test case template download feature
-# ---------------------------
-def test_case_template_download():
-    st.subheader("Manual Test Case Template (Download)")
-    template = [
-        ["No.", "Test Case", "Action Performed", "Expected Outcome", "Observed Result", "Pass/Fail", "Screenshot Path/Note"]
-    ]
-    # Add sample starter rows
-    for i in range(1, 6):
-        template.append([i, "", "", "", "", "", ""])
-    df = pd.DataFrame(template[1:], columns=template[0])
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download Test Case Template (CSV)", data=csv, file_name="manual_test_cases_template.csv", mime="text/csv")
-    st.info("Make at least 20 manual tests. Save screenshots and complete the CSV with results.")
+# -------------------- PROFILE --------------------
+def update_profile():
+    st.write("### 🧾 Update Profile Info")
+    new_email = st.text_input("New Email")
+    if st.button("Update Email"):
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", new_email):
+            st.warning("Invalid email format.")
+        else:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE users SET email = ? WHERE username = ?", (new_email, st.session_state.username))
+            conn.commit()
+            conn.close()
+            log_action(st.session_state.username, "Email Updated")
+            st.success("✅ Email updated successfully!")
 
-# ---------------------------
-# Navigation / Main
-# ---------------------------
+# -------------------- ENCRYPTION DEMO --------------------
+def encryption_demo():
+    st.write("### 🔐 Data Encryption / Decryption")
+    data = st.text_input("Enter data to encrypt:")
+    if st.button("Encrypt"):
+        if data:
+            encrypted = fernet.encrypt(data.encode()).decode()
+            st.code(encrypted)
+            st.session_state["last_encrypted"] = encrypted
+        else:
+            st.warning("Please enter data first.")
+    if st.button("Decrypt"):
+        if "last_encrypted" in st.session_state:
+            decrypted = fernet.decrypt(st.session_state["last_encrypted"].encode()).decode()
+            st.code(decrypted)
+        else:
+            st.warning("Nothing to decrypt yet.")
+
+# -------------------- AUDIT LOG --------------------
+def show_logs():
+    st.write("### 📜 User Activity Logs")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT username, action, timestamp FROM audit_log ORDER BY id DESC")
+    logs = c.fetchall()
+    conn.close()
+    for l in logs:
+        st.text(f"{l[2]} | {l[0]} | {l[1]}")
+
+# -------------------- MAIN --------------------
 def main():
-    st.set_page_config(page_title="Secure FinTech Demo - HBL", layout="wide")
-    initialize_session_state()
+    st.title("💳 Secure FinTech Application")
+    st.markdown("This app demonstrates **secure authentication, encryption, and manual cybersecurity testing**.")
 
-    # Top bar
-    st.title("Flow of Funds – HBL (Secure FinTech Demo)")
-    # Left navigation
-    menu = ["Home", "Register", "Login"]
-    if st.session_state.logged_in:
-        menu += ["Dashboard", "Profile", "Transaction", "Upload", "Logs", "Download Test Template", "Logout"]
+    menu = ["Login", "Register", "About"]
     choice = st.sidebar.selectbox("Menu", menu)
 
-    # Session expiry enforcement
-    if st.session_state.logged_in and is_session_expired():
-        st.warning("Session expired due to inactivity.")
-        logout()
-        st.experimental_rerun()
-
-    # Map selection to pages
     try:
-        if choice == "Home":
-            st.header("About this Demo")
-            st.write("""
-            This application is a small, secure FinTech demo built for educational purposes.
-            It demonstrates user registration & login with hashed passwords, encrypted data storage,
-            input validation, session management, audit logging, and file upload validation.
-            Use the sidebar to navigate. For assignment, perform at least 20 manual tests and document them.
-            """)
-            st.markdown("**Note:** This demo is for learning & manual testing only. Do not use in production without further security review.")
-            test_case_template_download()
+        if choice == "Login":
+            if is_logged_in():
+                dashboard()
+            else:
+                login()
         elif choice == "Register":
-            registration_page()
-        elif choice == "Login":
-            if st.session_state.logged_in:
-                st.info("Already logged in.")
-            else:
-                login_page()
-        elif choice == "Dashboard":
-            if not st.session_state.logged_in:
-                st.warning("Please login first.")
-            else:
-                dashboard_page()
-                logout_button()
-        elif choice == "Transaction":
-            if not st.session_state.logged_in:
-                st.warning("Please login first.")
-            else:
-                transaction_page()
-                logout_button()
-        elif choice == "Profile":
-            if not st.session_state.logged_in:
-                st.warning("Please login first.")
-            else:
-                profile_page()
-                logout_button()
-        elif choice == "Upload":
-            if not st.session_state.logged_in:
-                st.warning("Please login first.")
-            else:
-                upload_page()
-                logout_button()
-        elif choice == "Logs":
-            if not st.session_state.logged_in:
-                st.warning("Please login first.")
-            else:
-                logs_page()
-                logout_button()
-        elif choice == "Download Test Template":
-            if not st.session_state.logged_in:
-                st.warning("Please login first.")
-            else:
-                test_case_template_download()
-                logout_button()
-        elif choice == "Logout":
-            logout()
-            st.success("Logged out.")
-            st.experimental_rerun()
-    except Exception:
-        st.error("An unexpected error occurred. Please try again later.")
-        # Do not reveal internal error
+            register()
+        elif choice == "About":
+            st.info("""
+            **Secure FinTech Application**  
+            - Encrypted passwords (bcrypt)  
+            - Input validation & sanitization  
+            - Secure session management  
+            - Audit logs  
+            - Encryption/decryption demo  
+            - Manual cybersecurity test ready (20 test cases)
+            """)
+    except Exception as e:
+        st.error("⚠️ A controlled error occurred. Sensitive details are hidden for security.")
+        log_action("SYSTEM", f"Error: {str(e)}")
 
 if __name__ == "__main__":
     main()
-
