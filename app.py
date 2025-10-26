@@ -38,7 +38,7 @@ except ConnectionFailure:
     st.stop()
 
 # Use your actual database name and collection names
-db = client["fintech_db"]
+db = client["fintech"]
 users_col = db["users"]
 audit_col = db["audit_log"]
 
@@ -283,3 +283,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
