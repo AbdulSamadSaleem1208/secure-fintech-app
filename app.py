@@ -1,13 +1,12 @@
 import streamlit as st
 import sqlite3
-from flask_bcrypt import Bcrypt
+import bcrypt
 from cryptography.fernet import Fernet
 import re
 import time
 import os
 
 # -------------------- INITIAL SETUP --------------------
-bcrypt = Bcrypt()
 DB_FILE = "fintech_secure.db"
 KEY_FILE = "secret.key"
 
@@ -31,7 +30,7 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT UNIQUE,
                     email TEXT,
-                    password TEXT
+                    password BLOB
                 )""")
     c.execute("""CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +86,7 @@ def register():
             st.warning("Password must include upper, lower, digit, and special character.")
             return
 
-        hashed_pw = bcrypt.generate_password_hash(password).decode("utf-8")
+        hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
         try:
             conn = sqlite3.connect(DB_FILE)
@@ -114,7 +113,7 @@ def login():
         user = c.fetchone()
         conn.close()
 
-        if user and bcrypt.check_password_hash(user[0], password):
+        if user and bcrypt.checkpw(password.encode('utf-8'), user[0]):
             st.session_state.logged_in = True
             st.session_state.username = username
             log_action(username, "User Logged In")
