@@ -10,3 +10,4 @@ requests
 Pillow
 streamlit-option-menu
 streamlit-extras
+passlib
