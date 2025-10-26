@@ -1,6 +1,4 @@
-streamlit==1.50.0
-pandas==2.2.3
+streamlit==1.39.0
 bcrypt==4.1.2
-passlib==1.7.4
-cryptography==43.0.1
-filetype==1.2.0
+cryptography==43.0.0
+email-validator==2.1.0
