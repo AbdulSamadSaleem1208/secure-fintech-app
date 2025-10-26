@@ -5,6 +5,7 @@ import re
 import time
 import os
 from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
 # -------------------- INITIAL SETUP --------------------
 KEY_FILE = "secret.key"
@@ -24,9 +25,20 @@ def load_key():
 
 fernet = Fernet(load_key())
 
-# -------------------- MONGODB SETUP --------------------
-client = MongoClient("mongodb://localhost:27017/")
-db = client["fintech_app"]
+# -------------------- MONGODB ATLAS CONNECTION --------------------
+# ✅ Use your MongoDB Atlas connection string here
+MONGO_URI = "mongodb+srv://abdulsamadsaleem1208_db_user:gJrAH4XNTJ4IA1EJ@cluster0.qkvquvb.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')  # test connection
+    st.sidebar.success("✅ Connected to MongoDB Atlas")
+except ConnectionFailure:
+    st.sidebar.error("⚠️ Cannot connect to MongoDB Atlas. Check your network or URI.")
+    st.stop()
+
+# Use your actual database name and collection names
+db = client["fintech_db"]
 users_col = db["users"]
 audit_col = db["audit_log"]
 
@@ -255,7 +267,8 @@ def main():
             register()
         elif choice == "About":
             st.info("""
-            **Secure FinTech Application (MongoDB version)**  
+            **Secure FinTech Application (MongoDB Atlas version)**  
+            - MongoDB Cloud database ✅  
             - SQL Injection protection ✅  
             - Password & email validation ✅  
             - Session timeout (10 min) ✅  
